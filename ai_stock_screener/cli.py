@@ -29,6 +29,12 @@ def main():
                     help="Disable GPU acceleration (force CPU-only mode)")
     parser.add_argument("--gpu_info", action="store_true",
                     help="Display GPU information and exit")
+    parser.add_argument("--force_retrain", action="store_true",
+                    help="Force model retraining (ignore cache)")
+    parser.add_argument("--model_cache_dir", type=str, default="model_cache",
+                    help="Directory for model cache (default: model_cache)")
+    parser.add_argument("--max_model_age", type=int, default=72,
+                    help="Maximum model age in hours before retraining (default: 72 for eval, 24 for discovery)")
 
     args = parser.parse_args()
 
@@ -53,7 +59,10 @@ def main():
         "grid_search": args.grid_search,
         "ensemble_runs": args.ensemble_runs,
         "integrate_market": not args.no_integrate_market,
-        "use_gpu": not args.no_gpu
+        "use_gpu": not args.no_gpu,
+        "force_retrain": args.force_retrain,
+        "model_cache_dir": args.model_cache_dir,
+        "max_model_age": args.max_model_age
     }
 
     if args.mode == "eval":

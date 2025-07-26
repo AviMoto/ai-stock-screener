@@ -9,10 +9,13 @@ import joblib
 import numpy as np
 import sys
 import time
+import hashlib
+from datetime import datetime
 from .output_formatter import *
 from .clock import get_market_intelligence, MarketIntelligence, get_sector_intelligence, get_sector_for_stock, SectorIntelligence, calculate_dynamic_sector_multiplier
 from .news_intelligence import get_news_intelligence, calculate_news_multiplier, NewsIntelligence
 from .gpu_utils import get_gpu_manager, print_gpu_status
+from .model_cache import ModelCacheManager
 
 # 🔧 Centralized list of features used in training & prediction
 BASE_FEATURE_COLUMNS = [
@@ -346,7 +349,7 @@ def safe_cuml_predict_proba(model, X_data):
             console.print(f"⚠️ Fallback prediction also failed: {fallback_e}")
             raise e
 
-def train_model(df, config):
+def train_model(df, config, mode="eval"):
     X = df[FEATURE_COLUMNS]
     y = df["Label"]
     label_counts = y.value_counts().to_dict()
@@ -354,6 +357,27 @@ def train_model(df, config):
     if y.sum() == 0:
         console.print("⚠️ Model training skipped — no high-growth (label=1) samples present.")
         return None
+
+    # 🔄 Model Caching System Integration
+    cache_manager = ModelCacheManager(config.get("model_cache_dir", "model_cache"))
+    
+    # Generate data hash for model fingerprinting
+    data_hash = hashlib.md5(df.to_string().encode()).hexdigest()[:8]
+    fingerprint = cache_manager.get_model_fingerprint(config, data_hash)
+    
+    # Check for cached model unless force_retrain is enabled
+    if not config.get("force_retrain", False):
+        cached_model = cache_manager.load_cached_model(fingerprint)
+        if cached_model is not None:
+            # Check if model should be retrained based on market conditions
+            current_conditions = cache_manager.get_current_market_conditions()
+            max_age_hours = config.get("max_model_age", 72 if mode == "eval" else 24)
+            
+            if not cache_manager.should_retrain(fingerprint, current_conditions, mode, max_age_hours):
+                console.print(f"🔄 Using cached {config.get('model', 'random_forest')} model (fingerprint: {fingerprint[:8]})")
+                return cached_model
+            else:
+                console.print(f"🔄 Cached model found but retraining required")
 
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, random_state=config.get("seed", 42)
@@ -363,6 +387,8 @@ def train_model(df, config):
     grid_search = config.get("grid_search", 0)
     ensemble_runs = config.get("ensemble_runs", 1)
     n_estimators = config.get("n_estimators", 100)
+    
+    console.print(f"🏋️ Training new {model_type} model...")
 
     def build_model(seed):
         gpu_manager = get_gpu_manager()
@@ -540,6 +566,40 @@ def train_model(df, config):
     if config.get("save_model_path"):
         joblib.dump(final_model, config["save_model_path"])
 
+    # 💾 Cache the newly trained model
+    if not config.get("force_retrain", False) or config.get("cache_new_models", True):
+        try:
+            current_conditions = cache_manager.get_current_market_conditions()
+            metadata = {
+                'created_at': str(datetime.now()),
+                'model_type': model_type,
+                'parameters': {
+                    'n_estimators': n_estimators,
+                    'grid_search': grid_search,
+                    'ensemble_runs': ensemble_runs,
+                    'use_gpu': config.get('use_gpu', True),
+                    'period': config.get('period', '1y'),
+                    'future_days': config.get('future_days', 5),
+                    'threshold': config.get('threshold', 0.0),
+                    'use_sharpe_labeling': config.get('use_sharpe_labeling', 1.0),
+                    'integrate_market': config.get('integrate_market', True)
+                },
+                'data_hash': data_hash,
+                'market_regime': current_conditions.get('market_regime', 'unknown'),
+                'vix': current_conditions.get('vix', 20.0),
+                'spy_trend': current_conditions.get('spy_trend', 'sideways'),
+                'training_samples': len(X_train),
+                'feature_count': len(FEATURE_COLUMNS),
+                'label_distribution': label_counts,
+                'mode': mode
+            }
+            
+            cache_manager.save_model(final_model, fingerprint, metadata)
+            
+        except Exception as e:
+            console.print(f"⚠️ Failed to cache model: {e}")
+            # Don't fail the entire training process if caching fails
+
     return final_model
 
 def run_screening(tickers, config, mode="eval", news_analysis=False):
@@ -613,7 +673,7 @@ def run_screening(tickers, config, mode="eval", news_analysis=False):
     # Pass news analysis flag to config for model training decisions
     config["news_analysis"] = news_analysis
     
-    clf = train_model(combined, config)
+    clf = train_model(combined, config, mode)
     if clf is None:
         console.print("⚠️ Skipping prediction due to insufficient positive training data.")
         return

@@ -1,0 +1,5 @@
+# Ignore all files in model_cache directory
+*
+
+# But keep the directory structure
+!.gitignore
